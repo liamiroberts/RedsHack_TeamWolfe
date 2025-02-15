@@ -1,0 +1,856 @@
+
+```{r}
+library(dplyr)
+library(readxl)
+library(tidyverse)
+library(data.table)
+library(caret)
+library(xgboost)
+```
+
+```{r}
+setwd("~/R/SABR Club/reds-hackathon-2025")
+savant_data <- read_csv("savant_data_2021_2023.csv")
+
+X2024_predicted_games_missed <- read_excel("2024_predicted_games_missed.xlsx")
+
+unique(savant_data$events)
+
+```
+
+
+
+```{r}
+batter_stats <- savant_data %>%
+  group_by(batter,game_year) %>%
+  summarise(
+    games_played = n_distinct(game_pk),
+    plate_appearances = sum(events %in% c(
+      "strikeout", "field_out", "walk", "force_out", "sac_fly", "single",
+      "hit_by_pitch", "double", "grounded_into_double_play", "home_run",
+      "fielders_choice", "field_error", "triple", "strikeout_double_play",
+      "fielders_choice_out", "double_play", "catcher_interf", "sac_bunt"
+    ), na.rm = TRUE),
+    at_bats = sum(events %in% c(
+      "single", "double", "triple", "home_run", "strikeout", "field_out",
+      "grounded_into_double_play", "fielders_choice", "field_error",
+      "other_out", "strikeout_double_play", "fielders_choice_out",
+      "double_play"
+    ), na.rm = TRUE),
+    singles = sum(events == "single", na.rm = TRUE),
+    doubles = sum(events == "double", na.rm = TRUE),
+    triples = sum(events == "triple", na.rm = TRUE),
+    home_runs = sum(events == "home_run", na.rm = TRUE),
+    hits = singles + doubles + triples + home_runs,
+    walks = sum(events == "walk", na.rm = TRUE),
+    strike_outs = sum(events == "strikeout", na.rm = TRUE) + sum(events == "strikeout_double_play", na.rm = TRUE), 
+    hit_by_pitch = sum(events == "hit_by_pitch", na.rm = TRUE),
+    sacrifice_hits = sum(events == "sac_bunt", na.rm = TRUE),
+    sacrifice_flies = sum(events == "sac_fly", na.rm = TRUE),
+    tb = sum(singles + (2 * doubles) + (3 * triples) + (4 * home_runs)),
+    ba = hits / at_bats,
+    slg = tb / at_bats,
+    obp = (hits + walks + hit_by_pitch) /
+      (plate_appearances - sacrifice_hits),
+    ops = slg + obp,
+    avg_ev = mean(launch_speed, na.rm = TRUE),
+    avg_la = mean(launch_angle, na.rm = TRUE),
+    bb_perc = walks/plate_appearances,
+    k_perc = strike_outs/plate_appearances,
+    xba = mean(estimated_ba_using_speedangle, na.rm = TRUE),
+    woba = mean(woba_value, na.rm = TRUE),
+    xwobacon = mean(estimated_woba_using_speedangle, na.rm = TRUE),
+    hard_hit_balls = sum(launch_speed >= 95 & description != "foul", na.rm = TRUE),
+    bbe = sum(events %in% c(
+      "single", "double", "triple", "home_run", "field_out",
+      "grounded_into_double_play", "fielders_choice", "field_error",
+      "other_out", "strikeout_double_play", "fielders_choice_out",
+      "double_play"
+    ), na.rm = TRUE),
+    hard_hit_rate = ifelse(bbe > 0, hard_hit_balls / bbe, 0),
+    run_exp = mean(delta_run_exp, na.rm = TRUE),
+  ) %>%
+  ungroup()
+```
+
+```{r}
+filtered_savant_data <- savant_data %>% 
+  mutate(hitting_team = ifelse(inning_topbot == "Top", away_team, home_team)) %>% 
+  group_by(game_year, batter) %>% 
+  mutate(stand = ifelse(n_distinct(stand) > 1, "S", first(stand))) %>% 
+  group_by(game_year, batter) %>%
+  mutate(
+    scoring_pos = ifelse(!is.na(on_3b) | !is.na(on_2b),1,0)) %>% 
+  ungroup()
+
+  
+
+
+```
+
+
+
+```{r}
+
+filtered_savant_data <- filtered_savant_data %>%
+  group_by(batter, game_year) %>%
+  mutate(
+    total_games = n_distinct(game_pk),  #total number of games played by each batter in the given season
+    interval_number = ceiling(total_games / 10)  #split into 10 game intervals, 10 games in each interval ideally
+  ) %>%
+  arrange(game_year, game_date) %>%
+  group_by(batter, game_year) %>%
+  mutate(
+    game_order = dense_rank(game_date),  #order by date, earlier games are game 1, etc
+    interval = ceiling(game_order / (total_games / interval_number)) #rounds up to classify into an interval
+  ) %>%
+  ungroup() %>%
+  select(-c("interval_number", "total_games", "game_order")) #get rid of unnecessary columns
+
+```
+
+
+```{r}
+process_lineup_pos <- function(data) {
+  data %>%
+    arrange(game_pk, inning_topbot, pitch_number_appearance) %>%
+    group_by(game_pk, inning_topbot, batter, interval) %>%
+    mutate(
+      lineup_pos = ifelse(times_faced == 1, pitcher_at_bat_number, NA)
+    ) %>%
+    fill(lineup_pos, .direction = "down") %>%  
+    ungroup() %>%
+    mutate(
+      lineup_pos = ifelse(lineup_pos > 10, 10, lineup_pos)
+    )
+}
+
+data_w_lineupPos <- process_lineup_pos(filtered_savant_data)
+
+#avg_lineup_pos = round(mean(lineup_pos, na.rm = TRUE),2),
+```
+
+
+```{r}
+
+wPOS_batter_stats <- data_w_lineupPos %>%
+  group_by(batter, game_year) %>%
+  summarise(
+    games_played = n_distinct(game_pk),
+    
+    plate_appearances = sum(events %in% c(
+      "strikeout", "field_out", "walk", "force_out", "sac_fly", "single",
+      "hit_by_pitch", "double", "grounded_into_double_play", "home_run",
+      "fielders_choice", "field_error", "triple", "strikeout_double_play",
+      "fielders_choice_out", "double_play", "catcher_interf", "sac_bunt"
+    ), na.rm = TRUE),
+    
+    at_bats = sum(events %in% c(
+      "single", "double", "triple", "home_run", "strikeout", "field_out",
+      "grounded_into_double_play", "fielders_choice", "field_error",
+      "other_out", "strikeout_double_play", "fielders_choice_out",
+      "double_play"
+    ), na.rm = TRUE),
+    
+    avg_lineup_pos = round(mean(lineup_pos, na.rm = TRUE), 2),
+    
+    singles = sum(events == "single", na.rm = TRUE),
+    doubles = sum(events == "double", na.rm = TRUE),
+    triples = sum(events == "triple", na.rm = TRUE),
+    home_runs = sum(events == "home_run", na.rm = TRUE),
+    hits = singles + doubles + triples + home_runs,
+    walks = sum(events == "walk", na.rm = TRUE),
+    
+    strike_outs = sum(events == "strikeout", na.rm = TRUE) + sum(events == "strikeout_double_play", na.rm = TRUE), 
+    
+    hit_by_pitch = sum(events == "hit_by_pitch", na.rm = TRUE),
+    sacrifice_hits = sum(events == "sac_bunt", na.rm = TRUE),
+    sacrifice_flies = sum(events == "sac_fly", na.rm = TRUE),
+    
+    tb = sum(singles + (2 * doubles) + (3 * triples) + (4 * home_runs)),
+    
+    ba = hits / at_bats,
+    slg = tb / at_bats,
+    obp = (hits + walks + hit_by_pitch) / (plate_appearances - sacrifice_hits),
+    ops = slg + obp,
+    
+    avg_ev = mean(launch_speed, na.rm = TRUE),
+    avg_la = mean(launch_angle, na.rm = TRUE),
+    
+    bb_perc = walks / plate_appearances,
+    k_perc = strike_outs / plate_appearances,
+    xba = mean(estimated_ba_using_speedangle, na.rm = TRUE),
+    woba = mean(woba_value, na.rm = TRUE),
+    xwobacon = mean(estimated_woba_using_speedangle, na.rm = TRUE),
+    
+    hard_hit_balls = sum(launch_speed >= 95 & description != "foul", na.rm = TRUE),
+    
+    bbe = sum(events %in% c(
+      "single", "double", "triple", "home_run", "field_out",
+      "grounded_into_double_play", "fielders_choice", "field_error",
+      "other_out", "strikeout_double_play", "fielders_choice_out",
+      "double_play"
+    ), na.rm = TRUE),
+    
+    hard_hit_rate = ifelse(bbe > 0, hard_hit_balls / bbe, 0),
+    run_exp = mean(delta_run_exp, na.rm = TRUE),
+
+    # -------------------- Stats with Runners in Scoring Position (RISP) -------------------- #
+    plate_appearances_risp = sum(scoring_pos == 1 & events %in% c(
+      "strikeout", "field_out", "walk", "force_out", "sac_fly", "single",
+      "hit_by_pitch", "double", "grounded_into_double_play", "home_run",
+      "fielders_choice", "field_error", "triple", "strikeout_double_play",
+      "fielders_choice_out", "double_play", "catcher_interf", "sac_bunt"
+    ), na.rm = TRUE),
+
+    walks_risp = sum(scoring_pos == 1 & events == "walk", na.rm = TRUE),
+    strike_outs_risp = sum(scoring_pos == 1 & events %in% c("strikeout", "strikeout_double_play"), na.rm = TRUE),
+    xwobacon_risp = mean(ifelse(scoring_pos == 1, estimated_woba_using_speedangle, NA), na.rm = TRUE),
+    
+    bb_perc_risp = ifelse(plate_appearances_risp > 0, walks_risp / plate_appearances_risp, NA),
+    k_perc_risp = ifelse(plate_appearances_risp > 0, strike_outs_risp / plate_appearances_risp, NA)
+  ) %>%
+  ungroup()
+
+```
+
+
+###########################################################################
+Model without Games Played, and games missed instead
+
+
+
+```{r}
+wPOS_batter_stats_streaks <- wPOS_batter_stats %>% 
+  left_join(X2024_predicted_games_missed, by = "batter") %>% 
+    mutate(age = case_when(
+     game_year == 2021 ~ age-2,
+     game_year == 2022 ~ age-1,
+     game_year == 2023 ~ age
+    ),
+    x_games_missed = case_when(
+      game_year == 2021 ~ games_missed_2022,
+    game_year == 2022 ~ games_missed_2023,
+    game_year == 2023 ~ predicted_games_missed_2024
+    )
+    )
+
+keys <- wPOS_batter_stats_streaks %>% dplyr::select(batter, game_year)
+
+features <- wPOS_batter_stats_streaks %>% 
+  ungroup() %>% 
+  dplyr::select(-c(at_bats, games_played, singles:tb, slg:avg_la, plate_appearances, hard_hit_balls, bbe, walks_risp, strike_outs_risp, plate_appearances_risp, batter, game_year, total_missed_streaks, total_missed_days_in_streaks, games_missed_2022:predicted_games_missed_2024))
+
+target <- wPOS_batter_stats_streaks %>% 
+  ungroup() %>% 
+  dplyr::select(plate_appearances)
+
+target <- as.numeric(unlist(target))
+
+feature_matrix <- as.matrix(features)
+
+```
+
+
+```{r}
+dtrain <- xgb.DMatrix(data = feature_matrix, label = target) #target is PA
+
+params <- list(
+    objective = "reg:squarederror",  
+    eta = 0.1,                       #learning rate
+    max_depth = 6,                   #max depth of the trees
+    nthread = parallel::detectCores() - 1  
+)
+
+set.seed(21025)
+cv_results <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    nfold = 5,  #5 folds
+    metrics = "rmse",  
+    verbose = 1,
+    early_stopping_rounds = 10  #early stopping to go quicker
+)
+
+best_nrounds <- cv_results$best_iteration #best number of boosting rounds
+
+PA_model <- xgboost(
+    data = dtrain,
+    params = params,
+    nrounds = best_nrounds,
+    verbose = 1  
+)
+
+```
+
+```{r}
+predict_data <- data_w_lineupPos %>% 
+   group_by(batter, game_year) %>%
+  summarise(
+    games_played = n_distinct(game_pk),
+    plate_appearances = sum(events %in% c(
+      "strikeout", "field_out", "walk", "force_out", "sac_fly", "single",
+      "hit_by_pitch", "double", "grounded_into_double_play", "home_run",
+      "fielders_choice", "field_error", "triple", "strikeout_double_play",
+      "fielders_choice_out", "double_play", "catcher_interf", "sac_bunt"
+    ), na.rm = TRUE),
+    at_bats = sum(events %in% c(
+      "single", "double", "triple", "home_run", "strikeout", "field_out",
+      "grounded_into_double_play", "fielders_choice", "field_error",
+      "other_out", "strikeout_double_play", "fielders_choice_out",
+      "double_play"
+    ), na.rm = TRUE),
+    avg_lineup_pos = round(mean(lineup_pos, na.rm = TRUE), 2),
+    singles = sum(events == "single", na.rm = TRUE),
+    doubles = sum(events == "double", na.rm = TRUE),
+    triples = sum(events == "triple", na.rm = TRUE),
+    home_runs = sum(events == "home_run", na.rm = TRUE),
+    hits = singles + doubles + triples + home_runs,
+    walks = sum(events == "walk", na.rm = TRUE),
+    strike_outs = sum(events == "strikeout", na.rm = TRUE) + sum(events == "strikeout_double_play", na.rm = TRUE), 
+    hit_by_pitch = sum(events == "hit_by_pitch", na.rm = TRUE),
+    sacrifice_hits = sum(events == "sac_bunt", na.rm = TRUE),
+    sacrifice_flies = sum(events == "sac_fly", na.rm = TRUE),
+    tb = sum(singles + (2 * doubles) + (3 * triples) + (4 * home_runs)),
+    ba = hits / at_bats,
+    slg = tb / at_bats,
+    obp = (hits + walks + hit_by_pitch) / (plate_appearances - sacrifice_hits),
+    ops = slg + obp,
+    avg_ev = mean(launch_speed, na.rm = TRUE),
+    avg_la = mean(launch_angle, na.rm = TRUE),
+    bb_perc = walks / plate_appearances,
+    k_perc = strike_outs / plate_appearances,
+    xba = mean(estimated_ba_using_speedangle, na.rm = TRUE),
+    woba = mean(woba_value, na.rm = TRUE),
+    xwobacon = mean(estimated_woba_using_speedangle, na.rm = TRUE),
+    hard_hit_balls = sum(launch_speed >= 95 & description != "foul", na.rm = TRUE),
+    bbe = sum(events %in% c(
+      "single", "double", "triple", "home_run", "field_out",
+      "grounded_into_double_play", "fielders_choice", "field_error",
+      "other_out", "strikeout_double_play", "fielders_choice_out",
+      "double_play"
+    ), na.rm = TRUE),
+    hard_hit_rate = ifelse(bbe > 0, hard_hit_balls / bbe, 0),
+    run_exp = mean(delta_run_exp, na.rm = TRUE),
+
+    # -------------------- Stats with Runners in Scoring Position (RISP) -------------------- #
+    plate_appearances_risp = sum(scoring_pos == 1 & events %in% c(
+      "strikeout", "field_out", "walk", "force_out", "sac_fly", "single",
+      "hit_by_pitch", "double", "grounded_into_double_play", "home_run",
+      "fielders_choice", "field_error", "triple", "strikeout_double_play",
+      "fielders_choice_out", "double_play", "catcher_interf", "sac_bunt"
+    ), na.rm = TRUE),
+    walks_risp = sum(scoring_pos == 1 & events == "walk", na.rm = TRUE),
+    strike_outs_risp = sum(scoring_pos == 1 & events %in% c("strikeout", "strikeout_double_play"), na.rm = TRUE),
+    xwobacon_risp = mean(ifelse(scoring_pos == 1, estimated_woba_using_speedangle, NA), na.rm = TRUE),
+    bb_perc_risp = ifelse(plate_appearances_risp > 0, walks_risp / plate_appearances_risp, NA),
+    k_perc_risp = ifelse(plate_appearances_risp > 0, strike_outs_risp / plate_appearances_risp, NA)
+  ) %>%
+  ungroup() %>% 
+  left_join(X2024_predicted_games_missed, by = "batter") %>% 
+    mutate(age = case_when(
+     game_year == 2021 ~ age-2,
+     game_year == 2022 ~ age-1,
+     game_year == 2023 ~ age
+    ),
+    x_games_missed = case_when(
+      game_year == 2021 ~ games_missed_2022,
+    game_year == 2022 ~ games_missed_2023,
+    game_year == 2023 ~ predicted_games_missed_2024
+    )
+    )
+
+  
+```
+
+```{r}
+predict_22 <- predict_data %>% 
+    filter(game_year == 2021)
+
+
+keys_22 <- predict_22 %>% 
+  dplyr::select(batter) %>% 
+  unique()
+
+features_22 <- predict_22 %>% 
+  ungroup() %>% 
+  dplyr::select(-c(at_bats, games_played, singles:tb, slg:avg_la, plate_appearances, hard_hit_balls, bbe, walks_risp, strike_outs_risp, plate_appearances_risp, batter, game_year, total_missed_streaks, total_missed_days_in_streaks, games_missed_2021:predicted_games_missed_2024))
+
+
+feature_matrix_22 <- as.matrix(features_22)
+
+
+train_features <- colnames(feature_matrix)  # Features from training data
+test_features <- colnames(feature_matrix_22)  # Features from new prediction data
+
+setdiff(train_features, test_features)  # Features missing in `feature_matrix_22`
+setdiff(test_features, train_features)  # Extra features in `feature_matrix_22`
+
+target_22 <- predict_22 %>% 
+  ungroup() %>% 
+  dplyr::select(plate_appearances)
+
+target_22 <- as.numeric(unlist(target_22))
+
+
+dtrain <- xgb.DMatrix(data = feature_matrix_22, label = target_22) #target is PA
+
+params <- list(
+    objective = "reg:squarederror",  
+    eta = 0.1,                       #learning rate
+    max_depth = 6,                   #max depth of the trees
+    nthread = parallel::detectCores() - 1  
+)
+
+set.seed(21025)
+cv_results <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    nfold = 5,  #5 folds
+    metrics = "rmse",  
+    verbose = 1,
+    early_stopping_rounds = 10  #early stopping to go quicker
+)
+
+best_nrounds <- cv_results$best_iteration #best number of boosting rounds
+
+PA_model <- xgboost(
+    data = dtrain,
+    params = params,
+    nrounds = best_nrounds,
+    verbose = 1  
+)
+```
+
+```{r}
+PA_22_predictions <- predict(PA_model, newdata = feature_matrix_22)
+
+PA_22_predictions <- data.frame(
+  batter = keys_22$batter,
+  Plate_Appearances = PA_22_predictions
+)
+
+importance_matrix <- xgb.importance(model = PA_model, feature_names = colnames(features_22))
+print(importance_matrix)
+
+#print importance without GP, as that was the biggest influence
+xgb.plot.importance(importance_matrix[1:10])
+
+```
+
+```{r}
+
+
+predict_data_21_22 <- predict_data %>% 
+  filter(game_year %in% c(2021, 2022)) %>% 
+  left_join(PA_22_predictions, by = "batter") %>% 
+  rename(pred_pa = Plate_Appearances) %>% 
+  mutate(
+         pa_error_22 = ifelse(game_year == 2022, plate_appearances - pred_pa, NA),
+         pa_error_22 = ifelse(is.na(pa_error_22),0,pa_error_22)
+    ) %>% 
+  filter(game_year == 2022)
+
+
+keys_23 <- predict_data_21_22 %>% 
+  dplyr::select(batter)
+
+features_23 <- predict_data_21_22 %>% 
+  ungroup() %>% 
+  dplyr::select(-c(at_bats, games_played, singles:tb, slg:avg_la, plate_appearances, hard_hit_balls, bbe, walks_risp, strike_outs_risp, plate_appearances_risp, batter, game_year, pred_pa, total_missed_streaks, total_missed_days_in_streaks, games_missed_2021:predicted_games_missed_2024))
+
+target_23 <- predict_data_21_22 %>% 
+  ungroup() %>% 
+  dplyr::select(plate_appearances)
+
+target_23 <- as.numeric(unlist(target_23))
+
+feature_matrix_23 <- as.matrix(features_23)
+
+dtrain_23 <- xgb.DMatrix(data = feature_matrix_23, label = target_23) #target is PA
+
+params <- list(
+    objective = "reg:squarederror",  
+    eta = 0.1,                       #learning rate
+    max_depth = 6,                   #max depth of the trees
+    nthread = parallel::detectCores() - 1  
+)
+
+set.seed(232121025)
+cv_results <- xgb.cv(
+    params = params,
+    data = dtrain_23,
+    nrounds = 100,
+    nfold = 5,  #5 folds
+    metrics = "rmse",  
+    verbose = 1,
+    early_stopping_rounds = 10  #early stopping to go quicker
+)
+
+best_nrounds <- cv_results$best_iteration #best number of boosting rounds
+
+PA_model_23 <- xgboost(
+    data = dtrain_23,
+    params = params,
+    nrounds = best_nrounds,
+    verbose = 1  
+)
+
+
+
+
+train_features <- colnames(feature_matrix)  # Features from training data
+test_features <- colnames(feature_matrix_23)  # Features from new prediction data
+
+setdiff(train_features, test_features)  # Features missing in `feature_matrix_22`
+setdiff(test_features, train_features)
+```
+
+```{r}
+
+PA_23_predictions <- predict(PA_model_23, newdata = feature_matrix_23)
+
+PA_23_predictions <- data.frame(
+  batter = keys_23$batter,
+  Plate_Appearances = PA_23_predictions
+)
+
+
+importance_matrix <- xgb.importance(model = PA_model_23, feature_names = colnames(features_23))
+print(importance_matrix)
+
+#print importance without GP, as that was the biggest influence
+xgb.plot.importance(importance_matrix[1:13])
+
+
+```
+
+
+``` {r}
+
+predict_data_21_22_23 <- predict_data %>% 
+  filter(game_year %in% c(2021, 2022, 2023)) %>% 
+  left_join(PA_22_predictions, by = "batter") %>% 
+  rename(pred_pa_22 = Plate_Appearances) %>%
+  left_join(PA_23_predictions, by = "batter") %>% 
+  rename(pred_pa_23 = Plate_Appearances) %>% 
+  mutate(
+         pa_error_22 = ifelse(game_year == 2022, plate_appearances - pred_pa_22, NA),
+         pa_error_22 = ifelse(is.na(pa_error_22),0,pa_error_22),
+         pa_error_23 = ifelse(game_year == 2023, plate_appearances - pred_pa_23, NA),
+         pa_error_23 = ifelse(is.na(pa_error_23),0,pa_error_23)
+    ) %>% 
+  group_by(batter) %>%
+  arrange(batter, game_year) %>% 
+  mutate(pa_error_22 = ifelse(game_year == 2023, pa_error_22[game_year == 2022],pa_error_22),
+         pa_error_22 = ifelse(is.na(pa_error_22), 0, pa_error_22)) %>% 
+  filter(game_year == 2023) %>% 
+  ungroup()
+
+
+keys_24 <- predict_data_21_22_23 %>% 
+  dplyr::select(batter)
+
+features_24 <- predict_data_21_22_23 %>% 
+  ungroup() %>% 
+  dplyr::select(-c(at_bats, games_played, singles:tb, slg:avg_la, plate_appearances, hard_hit_balls, bbe, walks_risp, strike_outs_risp, plate_appearances_risp, batter, game_year, pred_pa_22, pred_pa_23, games_missed_2021:predicted_games_missed_2024))
+
+features_24[is.na(features_24)] <- 0
+
+target_24 <- predict_data_21_22_23 %>% 
+  ungroup() %>% 
+  dplyr::select(plate_appearances)
+
+target_24 <- as.numeric(unlist(target_24))
+
+feature_matrix_24 <- as.matrix(features_24)
+
+
+
+dtrain_24 <- xgb.DMatrix(data = feature_matrix_24, label = log(target_24)) #target is PA
+
+
+```
+
+
+```{r}
+#saving old grids that produced decent results
+
+
+
+set.seed(1245)
+param_grid_new <- expand.grid(
+  eta = 0.15,  
+  nrounds = 45,
+  gamma = c(0.15, 0.75, 0.9, 1.15, 1.5, 2.5),
+  max_depth = c(3, 4, 5, 6, 7, 8),         # Tree depth
+  lambda = c(0.05, 0.1, 0.6, 1.3, 3.9),
+  min_child_weight = c(1, 2, 3, 5, 10)  # Minimum sum of instance weight
+)
+
+
+
+
+
+
+ set.seed(126211)
+ param_grid_new <- expand.grid(
+  eta = 0.15,  
+  nrounds = 65,
+  gamma = c(0.15, 0.75, 0.9, 1.15, 1.5, 2.5),
+  max_depth = c(3, 4, 5, 6, 7, 8),         # Tree depth
+  lambda = c(0.05, 0.1, 0.6, 1.3, 3.9),
+  min_child_weight = c(1, 2, 3, 5, 10)  # Minimum sum of instance weight
+)
+  
+```
+
+
+
+
+``` {r}
+library(parallel)
+
+# Define hyperparameter grid
+param_grid <- expand.grid(
+  eta = c(0.1, 0.15, 0.2, 0.25, 0.3),       # Learning rate
+  nrounds = c(50, 75, 100, 125, 150, 175, 200),
+  gamma = 0,
+  max_depth = 6,         # Tree depth
+  lambda = 1,
+  min_child_weight = 1  # Minimum sum of instance weight
+)
+
+# Detect cores for parallel processing
+num_cores <- detectCores() - 1
+
+# Store results
+cv_results_list <- list()
+
+# Grid search with cross-validation
+for (i in 1:nrow(param_grid)) {
+  params <- list(
+    objective = "reg:squarederror",      # Regression task
+    eta = param_grid$eta[i],             # Learning rate
+    max_depth = param_grid$max_depth[i], # Tree depth
+    gamma = param_grid$gamma[i],         # Regularization term for splits
+    min_child_weight = param_grid$min_child_weight[i],  # Minimum sum of instance weight
+    lambda = param_grid$lambda[i],       # L2 regularization
+    nthread = num_cores                  # Parallel processing
+  )
+  
+  set.seed(12332025)
+  cv_result <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = param_grid$nrounds[i],      # Number of boosting rounds
+    nfold = 5,                           # Cross-validation folds
+    metrics = "rmse",                    # Performance metric
+    verbose = 0,                         # Silence verbosity
+    early_stopping_rounds = 10           # Early stopping rounds
+  )
+  
+  # Save best results
+  cv_results_list[[i]] <- list(
+    params = params,
+    best_rmse = min(cv_result$evaluation_log$test_rmse_mean),
+    best_nrounds = cv_result$best_iteration
+  )
+}
+
+# Find the best hyperparameters
+best_model <- cv_results_list[[which.min(sapply(cv_results_list, function(x) x$best_rmse))]]
+
+
+# Print best hyperparameters
+print(best_model$params)
+print(best_model$best_nrounds)
+print(best_model$best_rmse)
+
+
+
+set.seed(2122025)
+ param_grid_new <- expand.grid(
+  eta = 0.15,  
+  nrounds = 65,
+  gamma = c(0.15, 0.75, 0.9, 1.15, 1.5, 2.5),
+  max_depth = c(3, 4, 5, 6, 7, 8),         # Tree depth
+  lambda = c(0.05, 0.1, 0.6, 1.3, 3.9),
+  min_child_weight = c(1, 2, 3, 5, 10)  # Minimum sum of instance weight
+)
+
+# Detect cores for parallel processing
+num_cores <- detectCores() - 1
+
+# Store results
+cv_results_list <- list()
+
+
+print(param_grid_new$nrounds)
+sum(is.na(param_grid_new$nrounds))  # Check for NAs
+sum(is.nan(param_grid_new$nrounds)) # Check for NaNs
+sum(param_grid_new$nrounds <= 0)    # Check for 0 or negative values
+
+
+# Grid search with cross-validation
+for (i in 1:nrow(param_grid_new)) {
+  params <- list(
+    objective = "reg:squarederror",      # Regression task
+    eta = param_grid_new$eta[i],             # Learning rate
+    max_depth = param_grid_new$max_depth[i], # Tree depth
+    gamma = param_grid_new$gamma[i],         # Regularization term for splits
+    min_child_weight = param_grid_new$min_child_weight[i],  # Minimum sum of instance weight
+    lambda = param_grid_new$lambda[i],       # L2 regularization
+    nthread = num_cores                  # Parallel processing
+  )
+  
+  set.seed(106212)
+  cv_result <- xgb.cv(
+    params = params,
+    data = dtrain_24,
+    nrounds = param_grid_new$nrounds[i],      # Number of boosting rounds
+    nfold = 5,                           # Cross-validation folds
+    metrics = "rmse",                    # Performance metric
+    verbose = 0,                         # Silence verbosity
+    early_stopping_rounds = 10           # Early stopping rounds
+  )
+  
+  # Save best results
+  cv_results_list[[i]] <- list(
+    params = params,
+    best_rmse_new = min(cv_result$evaluation_log$test_rmse_mean),
+    best_nrounds_new = cv_result$best_iteration
+  )
+}
+
+# Find the best hyperparameters
+best_model_new <- cv_results_list[[which.min(sapply(cv_results_list, function(x) x$best_rmse_new))]]
+
+# Print best hyperparameters
+print(best_model_new$params)
+print(best_model_new$best_nrounds_new)
+print(best_model_new$best_rmse_new)
+
+
+
+
+
+
+
+
+params <- list(
+    objective = "reg:squarederror",  
+    eta = 0.2,                       #learning rate
+    lambda = 0.5,
+    min_child_weight = 5,
+    max_depth = 6,                   #max depth of the trees
+    nthread = parallel::detectCores() - 1  
+)
+
+set.seed(0824021025)
+cv_results <- xgb.cv(
+    params = params,
+    data = dtrain_24,
+    nrounds = 100,
+    nfold = 5,  #5 folds
+    metrics = "rmse",  
+    verbose = 1,
+    early_stopping_rounds = 10  #early stopping to go quicker
+)
+
+best_nrounds <- cv_results$best_iteration #best number of boosting rounds
+
+PA_model_24 <- xgboost(
+    data = dtrain_24,
+    params = best_model_new$params,
+    nrounds = best_model_new$best_nrounds_new,
+    verbose = 1  
+)
+
+
+
+
+train_features <- colnames(feature_matrix)  # Features from training data
+test_features <- colnames(feature_matrix_24)  # Features from new prediction data
+
+setdiff(train_features, test_features)  # Features missing in `feature_matrix_22`
+setdiff(test_features, train_features)
+```
+
+```{r}
+
+PA_24_predictions <- predict(PA_model_24, newdata = feature_matrix_24)
+PA_24_predictions <- exp(PA_24_predictions)
+
+PA_24_predictions <- data.frame(
+  batter = keys_24$batter,
+  Plate_Appearances = PA_24_predictions
+)
+
+
+importance_matrix <- xgb.importance(model = PA_model_24, feature_names = colnames(features_24))
+print(importance_matrix)
+
+importance_24 <- xgb.plot.importance(importance_matrix[1:18])
+
+importance_24 +
+  ggtitle("Feature Importance of XGBoost Model") +
+  xlab("Features") +
+  ylab("Gain") +
+  theme_minimal()
+
+importance_df <- as.data.frame(importance_matrix[1:18])
+
+# Ensure the feature names are treated as a factor (for ordering)
+importance_df$Feature <- factor(importance_df$Feature, levels = rev(importance_df$Feature[order(importance_df$Gain, decreasing = TRUE)]))
+
+# Plot using ggplot2
+importance_24 <- ggplot(importance_df, aes(x = Feature, y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +  # Flip for better readability
+  ggtitle("Feature Importance of XGBoost Model") +
+  xlab("Features") +
+  ylab("Gain") +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 15, face = "bold"),  # Title size
+    axis.title.x = element_text(size = 13, face = "bold"),  # X-axis label size
+    axis.title.y = element_text(size = 13, face = "bold"))
+
+ggsave("PA_feature_importance.png", plot = importance_24, width = 10, height = 6, dpi = 300)
+
+```
+
+```{r}
+#found batters to see how close it is
+judge_24_PA <- PA_24_predictions %>% 
+  filter(batter == "e42a90a0e1a26abdda5a1df8b9f5e94a10ab3c85")
+
+marcus_semien <- PA_24_predictions %>% 
+  filter(batter == "514eeb6e6c17085fc1adabf03f1adca32318411f")
+
+PA_density <- ggplot(PA_24_predictions, aes(x = Plate_Appearances)) +
+  geom_density(fill = "blue", alpha = 0.5) +
+  labs(title = "Density Plot of Predicted PA", x = "Predicted PA", y = "Density") +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 15, face = "bold"),  # Title size
+    axis.title.x = element_text(size = 13, face = "bold"),  # X-axis label size
+    axis.title.y = element_text(size = 13, face = "bold"))
+
+ggsave("PA_Density.png", plot = PA_density, width = 10, height = 6, dpi = 300)
+
+```
+
+```{r}
+#pull actual 2024 stats to compare density
+
+setwd("~/R/SABR Club/reds-hackathon-2025")
+
+X2024_real_batter_stats <- read_excel("2024_real_batter_stats.xlsx")
+
+ggplot(X2024_real_batter_stats, aes(x = PA)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  theme_minimal()
+```
+
